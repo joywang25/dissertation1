@@ -1,0 +1,255 @@
+library(data.table)
+library(tidyverse)
+library(ggplot2)
+library(VennDiagram)
+library(latex2exp)
+library(cowplot)
+### Data Pre-Processing
+
+# import gene data and expected mutability(reference table)
+data.dt <- fread("E:/1.Study/dissertation/project1/genie_data_mutations_extended.txt")
+expected_mutability <- fread("E:/1.Study/dissertation/project1/Expected_mutability.csv")
+
+# filter missense mutations and SNP mutations
+data <- data.dt[Variant_Classification == "Missense_Mutation" & Variant_Type == "SNP"]
+
+# remove Variant_classification and Variant_type after filtering 
+data1 <- data[,-c("Variant_Classification","Variant_type")]
+
+# check if all the mutations are point mutation
+stopifnot(sum(data$Start_Position == data$End_Position) == nrow(data))
+
+# remove variables with 50% missing values
+missing <- colSums(is.na(data))
+total.missing <- which(missing >= nrow(data)*0.5)
+data1<- data[, .SD, .SDcols = -names(total.missing)]
+
+
+# get the codon_id 
+data1$Codon_id <- paste(data1$Hugo_Symbol,substr(data1$HGVSp_Short,3,nchar(data1$HGVSp_Short)-1),sep = "_")
+# substr(data1$HGVSp_Short,3,nchar(data1$HGVSp_Short)-1) 
+data1 <-  merge(data1,expected_mutability,by = "Codon_id",all.x = TRUE)
+
+# check how many keys are not available  -- 41
+sum(is.na(data1$Expected_Mutability))
+# drop those missing data since the amount is small
+data1 <- data1[-which(is.na(data1$Expected_Mutability)),]
+
+# calculate mutation frequency
+data2 <- data1[, .(count = .N), by = Codon_id]
+# data2$Frequency <- data2$count/nrow(data1)
+data3 <- merge(data2,expected_mutability,by = "Codon_id",all.x = TRUE)
+
+data3 <- data3[order(count,decreasing = TRUE)]
+
+### Statistical Inference
+
+length(unique(data1$Tumor_Sample_Barcode))   #59815
+
+TEST <-data1[Codon_id=="KRAS_G12"]
+which(duplicated(TEST$Tumor_Sample_Barcode))
+
+p_value <- numeric(length(data3$Codon_id))
+
+n <- length(unique(data1$Tumor_Sample_Barcode))   #59815
+
+
+# tt <- numeric(nrow(data3))
+# for(i in 1:nrow(data3)){
+#   test <- data1[Codon_id == data3$Codon_id[i]]
+#   tt[i] <- sum(duplicated(test$Tumor_Sample_Barcode))
+# }
+
+
+
+library(tidyverse)
+testset <- data1 %>% group_by(Codon_id,Tumor_Sample_Barcode,HGVSp_Short) %>% summarise(n = n())
+testset$n_dup <- testset$n - 1
+testset1 <- testset %>% group_by(Codon_id) %>% summarise(count_dup = sum(n_dup))
+testset1 <- as.data.table(testset1)
+
+data4 <- left_join(data3,testset1,by = "Codon_id")
+data4 <- as.data.table(data4)
+data4 <- merge(data4,unique(data1[,c("Codon_id","Hugo_Symbol","Chromosome")]),by = "Codon_id", all.x = TRUE)
+
+data4$count1 <- data4$count - data4$count_dup
+p_value_by_tumor_sample <- data4[, binom.test(count1,n,Expected_Mutability,alternative = "greater")$p.value,by = 1:nrow(data4)]
+
+data4$p_value_by_tumor_sample <- p_value_by_tumor_sample$V1
+
+
+sig.BH <- data4[p.BH < 0.01]
+
+
+
+hist(data4$p_value_by_tumor_sample)
+hist(data4$p_value_by_tumor_sample, breaks = 50)
+
+
+
+
+# B-H procedure
+data3 <- data3[order(p_value_by_tumor_sample)]
+data3$order <- 1:nrow(data3)
+
+alpha <- 0.01
+data3$critical_value <- alpha*data3$order/nrow(data3)
+
+results <- data3[p_value_by_tumor_sample < critical_value]
+
+data4$p.BH <- p.adjust(data4$p_value_by_tumor_sample,"BH")
+data4$p.Holm <- p.adjust(data4$p_value_by_tumor_sample,"holm")
+data4$p.BY <- p.adjust(data4$p_value_by_tumor_sample,"BY")
+hist(p.BY)
+hist(p.BH)
+hist(p.bonferroni)
+
+
+data1[which(data1$Codon_id %in% results$Codon_id)]
+
+
+## validation
+pre_tcga_mutations_data <- fread("E:/1.Study/dissertation/project1/pre_tcga_mutations_data.txt")
+
+valid.data <- pre_tcga_mutations_data[Variant_Classification == "Missense_Mutation" & Variant_Type == "SNP"]
+
+valid.data$Codon_id <- paste(valid.data$Hugo_Symbol,substr(valid.data$HGVSp_Short,3,nchar(valid.data$HGVSp_Short)-1),sep = "_")
+valid.data1 <- valid.data[,.(count = .N),by = Codon_id]
+valid.data2 <- merge(valid.data1,expected_mutability,by = "Codon_id",all.x = TRUE)
+
+valid.testset <- valid.data %>% group_by(Codon_id,Tumor_Sample_Barcode,HGVSp_Short) %>% summarise(n = n())
+valid.testset$n_dup <- valid.testset$n - 1
+valid.testset1 <- valid.testset %>% group_by(Codon_id) %>% summarise(count_dup = sum(n_dup))
+valid.testset1 <- as.data.table(valid.testset1)
+
+valid.data3 <- left_join(valid.data2,valid.testset1,by = "Codon_id")
+
+valid.data3$count1 <- valid.data3$count - valid.data3$count_dup
+valid.data3 <- as.data.table(valid.data3)
+valid.data3 <- valid.data3[-which(is.na(Expected_Mutability))]
+valid.n <- length(unique(valid.data$Tumor_Sample_Barcode))  #1999
+valid.p_value_by_tumor_sample <- valid.data3[, binom.test(count1,valid.n,Expected_Mutability,alternative = "greater")$p.value,by = 1:nrow(valid.data3)]
+valid.data3$p_value_by_tumor_sample <- valid.p_value_by_tumor_sample$V1
+
+
+library(extraDistr)
+j <- seq(0, 1000, by = 0.1)
+plot(j, pbbinom(j, 1000, 5, 13), col = "red", lwd = 2)
+
+# significant codons seem to have higher expected mutability 
+boxplot(-log(sig.BH$Expected_Mutability, base = 10),-log(not.sig.BH$Expected_Mutability, base = 10))
+
+
+
+
+# figure 1
+# k.func <- function(m){
+#   # m: vector
+#   s <- seq(m)
+#   k <- sum(1/s)
+#   a <- ((m+1)/2)^2
+#   b <- m*k
+#   return(a-b)
+# }
+# 
+# k <- numeric(20)
+# for(i in 1:20){
+#   k[i] <- k.func(i)
+# }
+# 
+
+k.func <- function(m){
+  # m: vector
+  k <- numeric(length(m))
+  for(i in 1:length(m)){
+    s <- seq(m[i])
+    l <- sum(1/s)
+    a <- ((m[i]+1)/2)^2
+    b <- m[i]*l
+    k[i] <- a-b
+  }
+  return(k)
+}
+
+x <- 10:100000
+plot(x,(x+1)/2-sqrt(k.func(x)),type = "l")
+
+
+
+# plot(1:20,k, xlab = "i", ylab = "((m+1)/2)^2-ml")
+# abline(h=0,col = "red")
+df <- data.frame(i=1:20,k=k)
+
+fig1.1<- ggplot(df, aes(x=i, y=k)) + 
+  geom_point(size=1) + 
+  geom_hline(yintercept=0, linetype="dashed", color = "red") +
+  #geom_abline(intercept = 0.5, slope = 0.5) +
+  #labs(y = "((m+1)/2)^2-ml",x = "the number of test m") +
+  ylab(TeX("$(\\frac{m+1}{2})^2-ml$")) +
+  xlab(TeX("the number of tests $m$"))
+  #annotate(geom='text', x=20, y=20, label=TeX("$\\frac{m+1}{2}", output='character'), parse=TRUE)
+  #geom_text(aes(x = 18, y = 15, label = "(m+1)/2"))
+
+
+fig1.2 <- ggplot(data.frame(m=x,l=(x+1)/2-sqrt(k.func(x))),
+                 aes(x=m, y=l)) + 
+  geom_point(size=1) + 
+  ylab(TeX("$\\frac{m+1}{2}-\\sqrt{(\\frac{m+1}{2})^2-ml}$)")) +
+  xlab(TeX("the number of tests $m$"))
+
+figure1 <- plot_grid(fig1.2,fig1.1,labels = c('Figure 1-1','Figure 1-2'),label_x = 0.2,ncol = 2)
+figure1
+
+# +
+#   theme(plot.background = element_rect(fill = 'transparent', colour = NA),
+#         panel.background = element_rect(fill = 'transparent', colour = NA))
+
+
+# figure 2 Venn diagram
+judge <- function(x){
+  threshold <- 0.01
+  if(x<threshold){
+    return(1)
+  } else {
+    return(0)
+    }
+}
+
+data4$n.BY <- sapply(data4$p.BY,judge)
+data4$n.BH <- sapply(data4$p.BH,judge)
+data4$n.Holm <- sapply(data4$p.Holm,judge)
+
+grid.newpage()
+draw.triple.venn(area1 = nrow(data4[n.BH==1]), 
+                 area2 = nrow(data4[n.BY==1]), 
+                 area3 = nrow(data4[n.Holm==1]), 
+                 n12 = nrow(data4[n.BH==1 & n.BY ==1]), 
+                 n23 = nrow(data4[n.BY ==1 & n.Holm ==1]), 
+                 n13 = nrow(data4[n.BH==1 & n.Holm ==1]), 
+                 n123 = nrow(data4[n.BH==1 & n.BY ==1 & n.Holm ==1]), 
+                 cex = 0.7,
+                 category = c("Benjamini Hochberg", "Benjamini Yekutieli", "Holm"), lty = "blank", 
+                 fill = c("skyblue", "pink1", "orange"),
+                 scaled = TRUE,
+                 cat.pos = 1,
+                 cat.cex = 0.7,
+                 cat.dist = c(-0.01,-0.011,-0.05))
+
+# classifying as "driver","likely driver","unsure","unlikely driver"
+classification <- function(a,b,c){
+  if( a+b+c ==3){
+    return("driver")
+  }
+  if( a+b+c ==2){
+    return("likely driver")
+  }
+  if( a+b+c ==1){
+    return("unsure")
+  }
+  if( a+b+c ==0){
+    return("unlikely driver")
+  }
+}
+
+m <- data4[, classification(n.Holm,n.BY,n.BH),by = 1:nrow(data4)]
+data4$classification <-m$V1
